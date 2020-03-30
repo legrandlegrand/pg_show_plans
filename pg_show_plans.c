@@ -336,6 +336,15 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			es->format = EXPLAIN_FORMAT_JSON;
 			break;
 	};
+	
+	/* my customized explain (costs off) */
+	es->costs=false;
+#if PG_VERSION_NUM >= 120000
+	/* my customized explain (settings on) */
+	es->settings=true;
+#endif
+	/* end of my customization */
+	SpinLockRelease(&pgsp->elock);
 	SpinLockRelease(&pgsp->elock);
 
 	ExplainBeginOutput(es);
