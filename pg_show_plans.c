@@ -116,6 +116,7 @@ static int	pgsp_max;			/* max plans to show */
 static int	plan_format;		/* output format */
 #endif
 static int	max_plan_length;	/* max length of query plan */
+static bool	startup_enable;		/* startup value */
 
 /*
  * Function declarations
@@ -193,6 +194,17 @@ _PG_init(void)
 							 NULL);
 #endif
 
+		DefineCustomBoolVariable("pg_show_plans.startup_enable",
+							 "Selects whether pg_show_plans is enabled at startup.",
+							 NULL,
+							 &startup_enable,
+							 true,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	EmitWarningsOnPlaceholders("pg_show_plans");
 
 	RequestAddinShmemSpace(pgsp_memsize());
@@ -262,8 +274,8 @@ pgsp_shmem_startup(void)
 		SpinLockInit(&pgsp->elock);
 	}
 
-	/* Set the initial value to is_enable */
-	pgsp->is_enable = true;
+	/* Set the initial value based on startup_enable */
+	pgsp->is_enable = startup_enable;
 #if PG_VERSION_NUM >= 90500
 	pgsp->plan_format = plan_format;
 #endif
