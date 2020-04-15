@@ -28,6 +28,8 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "commands/explain.h"
+#include "utils/varlena.h"
+
 
 PG_MODULE_MAGIC;
 
@@ -117,6 +119,7 @@ static int	plan_format;		/* output format */
 #endif
 static int	max_plan_length;	/* max length of query plan */
 static bool	startup_enable;		/* startup value */
+static char *skip_queryids;		/* do not display plans for those queryids */
 
 /*
  * Function declarations
@@ -194,7 +197,7 @@ _PG_init(void)
 							 NULL);
 #endif
 
-		DefineCustomBoolVariable("pg_show_plans.startup_enable",
+	DefineCustomBoolVariable("pg_show_plans.startup_enable",
 							 "Selects whether pg_show_plans is enabled at startup.",
 							 NULL,
 							 &startup_enable,
@@ -204,7 +207,18 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
-
+							 
+	DefineCustomStringVariable("pg_show_plans.skip_queryids",
+							 "List of queryids to be excluded.",
+							 NULL,
+							 &skip_queryids,
+							 "",
+							 PGC_SIGHUP,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+						 
 	EmitWarningsOnPlaceholders("pg_show_plans");
 
 	RequestAddinShmemSpace(pgsp_memsize());
@@ -274,12 +288,12 @@ pgsp_shmem_startup(void)
 		SpinLockInit(&pgsp->elock);
 	}
 
-	/* Set the initial value based on startup_enable */
+	/* Set the initial value to is_enable */
 	pgsp->is_enable = startup_enable;
 #if PG_VERSION_NUM >= 90500
 	pgsp->plan_format = plan_format;
 #endif
-
+ 
 	/* Be sure everyone agrees on the hash table entry size */
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(pgspHashKey);
@@ -312,6 +326,10 @@ pgsp_shmem_shutdown(int code, Datum arg)
 static void
 pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	char       *skip_raw;
+    List       *skip_list;
+	ListCell   *skip_cell;
+
 #if PG_VERSION_NUM >= 90500
 	ExplainState *es = NewExplainState();
 #else
@@ -322,10 +340,6 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
-
-	/*
-	 * Execute EXPLAIN and Store the query plan into the hashtable
-	 */
 
 	/* Skip subsequent processing if is_enable is false */
 	SpinLockAcquire(&pgsp->elock);
@@ -348,16 +362,53 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			es->format = EXPLAIN_FORMAT_JSON;
 			break;
 	};
-	
 	/* my customized explain (costs off) */
 	es->costs=false;
 #if PG_VERSION_NUM >= 120000
 	/* my customized explain (settings on) */
-	es->settings=true;
+	// !!! removed because too much overhead 
+	// on sessions with non default settings !!!!
+	// es->settings=true;
 #endif
-	/* end of my customization */
 	SpinLockRelease(&pgsp->elock);
-	SpinLockRelease(&pgsp->elock);
+
+
+	/* Part for skipping some queryids */
+    if(skip_queryids)
+	{
+		/* TODO: building skip_list should be done in _PG_init()
+		   and the result stored in shared memory. 
+		   Today, impact on non excluded queries is quite high,
+		   and proportional to the number of queryies to be skipped :o(
+		*/
+		
+		/* Need a modifiable copy of string */
+		skip_raw = pstrdup(skip_queryids);
+	 
+		/* Parse string into list of identifiers */
+		if (!SplitIdentifierString(skip_raw, ',', &skip_list))
+		{
+			/* syntax error in name list */
+			GUC_check_errdetail("List syntax is invalid.");
+			pfree(skip_raw);
+			list_free(skip_list);
+		 return;
+		}
+
+		 /* Skip queryids using the list*/
+		 foreach(skip_cell, skip_list)
+		 {
+			uint64 skip_queryid = pg_strtouint64(lfirst(skip_cell), NULL, 10);
+
+	//		ereport(LOG,
+	//				(errmsg("skip_queryid: %lld  curid: %lld ",
+	//						skip_queryid, queryDesc->plannedstmt->queryId ),
+	//				 errhidecontext(true), errhidestmt(true)));
+			if (skip_queryid == queryDesc->plannedstmt->queryId)
+					 return;
+		 }
+	}
+
 
 	ExplainBeginOutput(es);
 	ExplainPrintPlan(es, queryDesc);
