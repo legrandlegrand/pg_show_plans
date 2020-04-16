@@ -96,6 +96,7 @@ query |
  - *plan*: the query plan of the running query.
 
 ## Configuration Parameters
+ - *pg_show_plans.skip_queryids* : text that defines a list of queryid (max 20 values) whose plans will be skipped. Default is none.
  - *pg_show_plans.startup_enable* : Boolean that defines if plans are enabled at startup, or not. Default is `true`.
  - *pg_show_plans.plan_format* : It controls the output format of query plans. It can be selected either `text` or `json`. Default is `text`.
  - *pg_show_plans.max_plan_length* : It sets the maximum length of query plans. Default is `8192` [byte]. Note that this parameter must be set to an integer.
