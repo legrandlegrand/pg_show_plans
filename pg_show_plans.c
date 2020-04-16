@@ -41,6 +41,7 @@ PG_MODULE_MAGIC;
 									 * to calculate the number of hash table
 									 * items: MaxConnections times
 									 * MAX_NESTED_LEVEL */
+#define PG_SHOW_PLANS_SKIP       20
 
 /*
  * Define data types
@@ -71,6 +72,8 @@ typedef struct pgspSharedState
 #if PG_VERSION_NUM >= 90500
 	int			plan_format;	/* plan format */
 #endif
+	uint64		skip_queryid[PG_SHOW_PLANS_SKIP];
+	size_t		skip_queryid_len;
 	slock_t		elock;			/* protects the variable `is_enable` and
 								 * `plan_format` */
 }			pgspSharedState;
@@ -218,7 +221,7 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
-						 
+				 
 	EmitWarningsOnPlaceholders("pg_show_plans");
 
 	RequestAddinShmemSpace(pgsp_memsize());
@@ -294,6 +297,51 @@ pgsp_shmem_startup(void)
 	pgsp->plan_format = plan_format;
 #endif
  
+	/* load queryids that should be skipped */
+    if(skip_queryids)
+	{
+		char       *skip_raw;
+		List       *skip_list;
+		ListCell   *skip_cell;
+		int i = 0 ;
+
+	/*
+	   TODO this should be updated on SIGUP only
+	   not for each new connection.
+	   This message is just a reminder that
+	   Auto vacuum starts every minute ...
+	*/
+			ereport(LOG,
+					(errmsg("guc: %s ",
+							skip_queryids ),
+					 errhidecontext(true), errhidestmt(true)));
+
+				
+		/* Need a modifiable copy of string */
+		skip_raw = pstrdup(skip_queryids);
+	 
+		/* Parse string into list of identifiers */
+		if (!SplitIdentifierString(skip_raw, ',', &skip_list))
+		{
+			/* syntax error in name list */
+			GUC_check_errdetail("List syntax is invalid.");
+			pfree(skip_raw);
+			list_free(skip_list);
+		 return;
+		}
+
+		 /* load queryids using the list*/
+		 foreach(skip_cell, skip_list)
+		 {
+			pgsp->skip_queryid[i] = pg_strtouint64(lfirst(skip_cell), NULL, 10);
+			i++;
+			if (i == PG_SHOW_PLANS_SKIP)
+				break;
+		 }
+		 pgsp->skip_queryid_len = i;
+	}
+
+
 	/* Be sure everyone agrees on the hash table entry size */
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(pgspHashKey);
@@ -326,9 +374,6 @@ pgsp_shmem_shutdown(int code, Datum arg)
 static void
 pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	char       *skip_raw;
-    List       *skip_list;
-	ListCell   *skip_cell;
 
 #if PG_VERSION_NUM >= 90500
 	ExplainState *es = NewExplainState();
@@ -364,51 +409,22 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	};
 	/* my customized explain (costs off) */
 	es->costs=false;
-#if PG_VERSION_NUM >= 120000
-	/* my customized explain (settings on) */
-	// !!! removed because too much overhead 
-	// on sessions with non default settings !!!!
-	// es->settings=true;
-#endif
 	SpinLockRelease(&pgsp->elock);
 
 
-	/* Part for skipping some queryids */
+	/* Skipping some queryids */
     if(skip_queryids)
 	{
-		/* TODO: building skip_list should be done in _PG_init()
-		   and the result stored in shared memory. 
-		   Today, impact on non excluded queries is quite high,
-		   and proportional to the number of queryies to be skipped :o(
-		*/
-		
-		/* Need a modifiable copy of string */
-		skip_raw = pstrdup(skip_queryids);
-	 
-		/* Parse string into list of identifiers */
-		if (!SplitIdentifierString(skip_raw, ',', &skip_list))
+		int i;
+		for (i = 0; i < pgsp->skip_queryid_len; i++)
 		{
-			/* syntax error in name list */
-			GUC_check_errdetail("List syntax is invalid.");
-			pfree(skip_raw);
-			list_free(skip_list);
-		 return;
+			if (pgsp->skip_queryid[i] == queryDesc->plannedstmt->queryId)
+			{
+				// TODO replace plan value with "Plan skipped for this queryid."  
+				return;
+			}
 		}
-
-		 /* Skip queryids using the list*/
-		 foreach(skip_cell, skip_list)
-		 {
-			uint64 skip_queryid = pg_strtouint64(lfirst(skip_cell), NULL, 10);
-
-	//		ereport(LOG,
-	//				(errmsg("skip_queryid: %lld  curid: %lld ",
-	//						skip_queryid, queryDesc->plannedstmt->queryId ),
-	//				 errhidecontext(true), errhidestmt(true)));
-			if (skip_queryid == queryDesc->plannedstmt->queryId)
-					 return;
-		 }
 	}
-
 
 	ExplainBeginOutput(es);
 	ExplainPrintPlan(es, queryDesc);
