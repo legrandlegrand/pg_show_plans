@@ -29,6 +29,7 @@ CREATE FUNCTION pg_show_plans(
     OUT level int8,
     OUT userid oid,
     OUT dbid oid,
+	OUT queryid bigint,
     OUT plan text
 )
 RETURNS SETOF record
