@@ -22,6 +22,10 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+
+#include "storage/procarray.h"
+// cf PANIC
+
 #include "storage/spin.h"
 #include "storage/shmem.h"
 #include "tcop/utility.h"
@@ -59,7 +63,7 @@ typedef struct pgspEntry
 	int			encoding;		/* query encoding */
 	int			plan_len;		/* # of valid bytes in query string */
 	slock_t		mutex;			/* protects the entry */
-	TransactionId topxid;		/* Top level transaction id of this query */
+//	TransactionId topxid;		/* Top level transaction id of this query */
 	char		plan[0];		/* query plan string */
 }			pgspEntry;
 
@@ -273,14 +277,14 @@ pgsp_shmem_startup(void)
 		pgsp->lock = LWLockAssign();
 #endif
 		SpinLockInit(&pgsp->elock);
-	}
 
 	/* Set the initial value to is_enable */
 	pgsp->is_enable = true;
 #if PG_VERSION_NUM >= 90500
 	pgsp->plan_format = plan_format;
 #endif
-
+	}
+	
 	/* Be sure everyone agrees on the hash table entry size */
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(pgspHashKey);
@@ -298,7 +302,12 @@ pgsp_shmem_startup(void)
 
 	if (!IsUnderPostmaster)
 		on_shmem_exit(pgsp_shmem_shutdown, (Datum) 0);
-	else
+	else 
+		/* 	??? source de :
+			PANIC:  cannot wait without a PGPROC structure
+			à la déconection d'autovacuum ???
+			ajout de !IsBackendPid(pid) dans entry_delete
+		*/
 		on_proc_exit(pgsp_on_proc_exit,(Datum) 0);
 	
 }
@@ -306,10 +315,6 @@ pgsp_shmem_startup(void)
 static void
 pgsp_on_proc_exit(int code, Datum arg)
 {
-	/* TODO 
-		manage level ++ deletion
-	*/
-	
 	entry_delete(getpid(), 0);
 	return;
 }
@@ -655,10 +660,11 @@ entry_store(char *plan, const int nested_level, const uint64 QueryId)
 	/* Look up the hash table entry with shared lock. */
 	LWLockAcquire(pgsp->lock, LW_SHARED);
 	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
-	LWLockRelease(pgsp->lock);
 
 	if (!entry)
 	{
+		LWLockRelease(pgsp->lock);
+		
 		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 
 		/* Create new entry */
@@ -668,7 +674,6 @@ entry_store(char *plan, const int nested_level, const uint64 QueryId)
 			LWLockRelease(pgsp->lock);
 			return;
 		}
-		LWLockRelease(pgsp->lock);
 	}
 	
 	/* Store data into the entry. */
@@ -678,19 +683,22 @@ entry_store(char *plan, const int nested_level, const uint64 QueryId)
 	e->dbid = MyDatabaseId;
 	e->queryid = QueryId;
 	e->encoding = GetDatabaseEncoding();
-	if (!RecoveryInProgress())
-		e->topxid = GetTopTransactionId();
-	else
+//	if (!RecoveryInProgress())
+//		e->topxid = GetTopTransactionId();
+//	else
 		/*
 		 * In recovery mode, we use pid as the key instead of txid for garbage
 		 * collection.
 		 */
-		e->topxid = (uint32) key.pid;
+//		e->topxid = (uint32) key.pid;
 	memcpy(entry->plan, plan, plan_len);
 	entry->plan_len = plan_len;
 	entry->plan[plan_len] = '\0';
+
 	SpinLockRelease(&e->mutex);
 
+	LWLockRelease(pgsp->lock);
+		
 	/* Delete old entries where nested_level > current_level. */
 	entry_delete(key.pid,nested_level+1);
 }
@@ -781,7 +789,7 @@ entry_delete(const uint32 pid, const int nested_level)
 	pgspHashKey key;
 
 	/* Safety check... */
-	if (!pgsp || !pgsp_hash)
+	if (!pgsp || !pgsp_hash || !IsBackendPid(pid))
 		return;
 
 	key.pid = pid;
@@ -996,37 +1004,37 @@ pg_show_plans(PG_FUNCTION_ARGS)
 			 * do not care about it because this function is not often
 			 * executed.
 			 */
-			int			num_backends = pgstat_fetch_stat_numbackends();
-			int			curr_backend;
-			uint32		pid = (uint32) entry->topxid;
-			bool		exists = false;
+//			int			num_backends = pgstat_fetch_stat_numbackends();
+//			int			curr_backend;
+//			uint32		pid = (uint32) entry->topxid;
+//			bool		exists = false;
 
-			for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
-			{
-				LocalPgBackendStatus *local_beentry;
-				PgBackendStatus *beentry;
+//			for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
+//			{
+//				LocalPgBackendStatus *local_beentry;
+//				PgBackendStatus *beentry;
 
-				local_beentry = pgstat_fetch_stat_local_beentry(curr_backend);
-				beentry = &local_beentry->backendStatus;
-				if (beentry->st_procpid == pid && beentry->st_state == STATE_RUNNING)
-				{
-					exists = true;
-					break;
-				}
-			}
+//				local_beentry = pgstat_fetch_stat_local_beentry(curr_backend);
+//				beentry = &local_beentry->backendStatus;
+//				if (beentry->st_procpid == pid && beentry->st_state == STATE_RUNNING)
+//				{
+//					exists = true;
+//					break;
+//				}
+//			}
 
-			if (!exists)
-			{
-				LWLockRelease(pgsp->lock);
+//			if (!exists)
+//			{
+//				LWLockRelease(pgsp->lock);
 
-				LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
-				LWLockRelease(pgsp->lock);
+//				LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+//				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+//				LWLockRelease(pgsp->lock);
 
-				LWLockAcquire(pgsp->lock, LW_SHARED);
+//				LWLockAcquire(pgsp->lock, LW_SHARED);
 
-				continue;
-			}
+//				continue;
+//			}
 		}
 
 		/* Set values */
