@@ -35,7 +35,7 @@ PG_MODULE_MAGIC;
 /*
  * Define constants
  */
-#define PG_SHOW_PLANS_COLS		 5
+#define PG_SHOW_PLANS_COLS		 6
 #define MAX_NESTED_LEVEL         5	/* This is a misleading name. It is used
 									 * to calculate the number of hash table
 									 * items: MaxConnections times
@@ -55,10 +55,11 @@ typedef struct pgspEntry
 	pgspHashKey key;			/* hash key of entry - MUST BE FIRST */
 	Oid			userid;			/* user OID */
 	Oid			dbid;			/* database OID */
+	uint64		queryid;
 	int			encoding;		/* query encoding */
 	int			plan_len;		/* # of valid bytes in query string */
 	slock_t		mutex;			/* protects the entry */
-	TransactionId topxid;		/* Top level transaction id of this query */
+//	TransactionId topxid;		/* Top level transaction id of this query */
 	char		plan[0];		/* query plan string */
 }			pgspEntry;
 
@@ -86,6 +87,7 @@ static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
 /* Links to shared memory state */
 static pgspSharedState * pgsp = NULL;
@@ -139,6 +141,7 @@ PG_FUNCTION_INFO_V1(pgsp_format_text);
 static Size pgsp_memsize(void);
 static void pgsp_shmem_startup(void);
 static void pgsp_shmem_shutdown(int code, Datum arg);
+static void pgsp_on_proc_exit(int code, Datum arg);
 static void pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pgsp_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 #if PG_VERSION_NUM >= 100000
@@ -150,9 +153,13 @@ static void pgsp_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 #endif
 static void pgsp_ExecutorFinish(QueryDesc *queryDesc);
 static void pgsp_ExecutorEnd(QueryDesc *queryDesc);
-
+static void pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+								ProcessUtilityContext context, ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest, QueryCompletion *qc);
+								
 static pgspEntry * entry_alloc(pgspHashKey * key, const char *query, int plan_len);
-static void entry_store(char *plan, const int nested_level);
+static void entry_store(char *plan, const int nested_level, const uint64 queryid);
 static void entry_delete(const uint32 pid, const int nested_level);
 static uint32 gen_hashkey(const void *key, Size keysize);
 static int	compare_hashkey(const void *key1, const void *key2, Size keysize);
@@ -218,6 +225,10 @@ _PG_init(void)
 
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = pgsp_ExecutorEnd;
+	
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = pgsp_ProcessUtility;
+
 }
 
 void
@@ -229,6 +240,7 @@ _PG_fini(void)
 	ExecutorRun_hook = prev_ExecutorRun;
 	ExecutorFinish_hook = prev_ExecutorFinish;
 	ExecutorEnd_hook = prev_ExecutorEnd;
+	ProcessUtility_hook = prev_ProcessUtility;
 }
 
 /*
@@ -239,6 +251,7 @@ pgsp_shmem_startup(void)
 {
 	bool		found;
 	HASHCTL		info;
+	TransactionId topxid;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -261,14 +274,14 @@ pgsp_shmem_startup(void)
 		pgsp->lock = LWLockAssign();
 #endif
 		SpinLockInit(&pgsp->elock);
-	}
-
 	/* Set the initial value to is_enable */
 	pgsp->is_enable = true;
 #if PG_VERSION_NUM >= 90500
 	pgsp->plan_format = plan_format;
 #endif
+	}
 
+	
 	/* Be sure everyone agrees on the hash table entry size */
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(pgspHashKey);
@@ -283,9 +296,36 @@ pgsp_shmem_startup(void)
 							  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
 	LWLockRelease(AddinShmemInitLock);
+	
+	/* 	
+		on MSYS2: on_proc_exit() is called only when there is 
+		an Assigned TransactionId, so keep one.
+		on Ubuntu: on_proc_exit() seems not being reached,
+		even with an Assigned Transaction Id !?
+		TODO: don't know how to fix that :o(
+	*/
+	if (!RecoveryInProgress())
+		topxid = GetTopTransactionId();
 
 	if (!IsUnderPostmaster)
 		on_shmem_exit(pgsp_shmem_shutdown, (Datum) 0);
+	else 
+		/* 	
+			"PANIC:  cannot wait without a PGPROC structure"
+			occured during autovacuum exit on MSYS2 !
+			TODO define the best fix:
+			??? restrict this to IsBackendPid(pid) 
+			or exclude IsAutoVacuumWorkerProcess ???
+		*/
+		on_proc_exit(pgsp_on_proc_exit,(Datum) 0);
+	
+}
+
+static void
+pgsp_on_proc_exit(int code, Datum arg)
+{
+	entry_delete(getpid(), 0);
+	return;
 }
 
 static void
@@ -306,7 +346,7 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 #else
 	ExplainState es;
 #endif
-
+	
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
@@ -339,6 +379,8 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	};
 	SpinLockRelease(&pgsp->elock);
 
+es->costs=false;
+	
 	ExplainBeginOutput(es);
 	ExplainPrintPlan(es, queryDesc);
 	ExplainEndOutput(es);
@@ -372,7 +414,23 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		SpinLockRelease(&pgsp->elock);
 	}
 
-	entry_store(es->str->data, nested_level);
+	if (!queryDesc->plannedstmt->queryId)
+		/* Queryid not initialized */
+		entry_store(es->str->data, nested_level, UINT64CONST(0));
+	else 
+		/* common query with pg_stat_statements activated*/
+		entry_store(es->str->data, nested_level,queryDesc->plannedstmt->queryId);
+
+			/* 
+				Utility statement TODO specific for CTAS
+			*/
+//			entry_store(es->str->data, nested_level,
+//						DatumGetUInt64(
+//						hash_any_extended((const unsigned char *)
+//							queryDesc->sourceText, strlen(queryDesc->sourceText)-1, 0)
+//									)
+//					);
+
 	pfree(es->str->data);
 
 #else
@@ -404,7 +462,7 @@ pgsp_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		SpinLockRelease(&pgsp->elock);
 	}
 
-	entry_store(es.str->data, nested_level);
+	entry_store(es.str->data, nested_level, queryDesc->plannedstmt->queryId);
 	pfree(es.str->data);
 #endif
 }
@@ -478,14 +536,14 @@ pgsp_ExecutorEnd(QueryDesc *queryDesc)
 {
 	/* Delete entry */
 
-	SpinLockAcquire(&pgsp->elock);
-	if (pgsp->is_enable)
-	{
-		SpinLockRelease(&pgsp->elock);
-		entry_delete(getpid(), nested_level);
-	}
-	else
-		SpinLockRelease(&pgsp->elock);
+//ply	SpinLockAcquire(&pgsp->elock);
+//	if (pgsp->is_enable)
+//	{
+//		SpinLockRelease(&pgsp->elock);
+//		entry_delete(getpid(), nested_level);
+//	}
+//	else
+//		SpinLockRelease(&pgsp->elock);
 
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);
@@ -494,10 +552,101 @@ pgsp_ExecutorEnd(QueryDesc *queryDesc)
 }
 
 /*
+ * ProcessUtility hook
+ */
+static void
+pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+					ProcessUtilityContext context,
+					ParamListInfo params, QueryEnvironment *queryEnv,
+					DestReceiver *dest, QueryCompletion *qc)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+	ExplainState *es = NewExplainState();
+	char	   *msg = "<utility>";
+
+
+	/*
+	 * If it's an EXECUTE statement, we don't track it and don't increment the
+	 * nesting level.  This allows the cycles to be charged to the underlying
+	 * PREPARE instead (by the Executor hooks), which is much more useful.
+	 *
+	 * We also don't track execution of PREPARE.  If we did, we would get one
+	 * hash table entry for the PREPARE (with hash calculated from the query
+	 * string), and then a different one with the same query string (but hash
+	 * calculated from the query tree) would be used to accumulate costs of
+	 * ensuing EXECUTEs.  This would be confusing, and inconsistent with other
+	 * cases where planning time is not included at all.
+	 *
+	 * Likewise, we don't track execution of DEALLOCATE.
+	 */
+	if (pgsp->is_enable &&
+		!IsA(parsetree, ExecuteStmt) 
+//		&&		!IsA(parsetree, CreateTableAsStmt) 
+		)
+	{
+
+		/*
+			replace plan text by <utility>
+		*/
+		memcpy(es->str->data, msg, strlen(msg));
+		es->str->len = strlen(msg);
+		es->str->data[es->str->len] = '\0';
+
+//		ereport(LOG,
+//			(errmsg("req: %s %lld",
+//				queryString, strlen(queryString) ),
+//				errhidecontext(true), errhidestmt(true)));
+						 
+
+		/* always compute queryid even if pgss not enable, because we can't know*/ 
+		entry_store(es->str->data, nested_level,
+						DatumGetUInt64(
+						hash_any_extended((const unsigned char *)
+							queryString, strlen(queryString)-1, 0)
+							)
+						);
+		pfree(es->str->data);
+
+		nested_level++;
+		PG_TRY();
+		{
+			if (prev_ProcessUtility)
+				prev_ProcessUtility(pstmt, queryString,
+									context, params, queryEnv,
+									dest, qc);
+			else
+				standard_ProcessUtility(pstmt, queryString,
+										context, params, queryEnv,
+										dest, qc);
+			nested_level--;
+		}
+		PG_CATCH();
+		{
+			nested_level--;
+			PG_RE_THROW();		
+		}
+		PG_END_TRY();
+
+	}
+	else
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString,
+								context, params, queryEnv,
+								dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString,
+									context, params, queryEnv,
+									dest, qc);
+	}
+}
+
+
+/*
  * Store a plan to the hashtable.
  */
 static void
-entry_store(char *plan, const int nested_level)
+entry_store(char *plan, const int nested_level, const uint64 QueryId)
 {
 	pgspHashKey key;
 	pgspEntry  *entry;
@@ -520,47 +669,37 @@ entry_store(char *plan, const int nested_level)
 	/* Look up the hash table entry with shared lock. */
 	LWLockAcquire(pgsp->lock, LW_SHARED);
 	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
-	LWLockRelease(pgsp->lock);
 
-	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-
-	/* Delete old entries if exist. */
-	if (entry != NULL)
+	if (!entry)
 	{
-		pgspHashKey tmp_key;
-
-		tmp_key.pid = key.pid;
-		tmp_key.nested_level = nested_level;
-		do
-		{
-			hash_search(pgsp_hash, &tmp_key, HASH_REMOVE, NULL);
-			tmp_key.nested_level++;
-		}
-		while (hash_search(pgsp_hash, &tmp_key, HASH_FIND, NULL) != NULL);
-	}
-
-	/* Create new entry */
-	if ((entry = entry_alloc(&key, "", 0)) == NULL)
-	{
-		/* New entry was not created since hashtable is full. */
 		LWLockRelease(pgsp->lock);
-		return;
-	}
+		
+		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 
+		/* Create new entry */
+		if ((entry = entry_alloc(&key, "", 0)) == NULL)
+		{
+			/* New entry was not created since hashtable is full. */
+			LWLockRelease(pgsp->lock);
+			return;
+		}
+	}
+	
 	/* Store data into the entry. */
 	e = (pgspEntry *) entry;
 	SpinLockAcquire(&e->mutex);
 	e->userid = GetUserId();
 	e->dbid = MyDatabaseId;
+	e->queryid = QueryId;
 	e->encoding = GetDatabaseEncoding();
-	if (!RecoveryInProgress())
-		e->topxid = GetTopTransactionId();
-	else
+//	if (!RecoveryInProgress())
+//		e->topxid = GetTopTransactionId();
+//	else
 		/*
 		 * In recovery mode, we use pid as the key instead of txid for garbage
 		 * collection.
 		 */
-		e->topxid = (uint32) key.pid;
+//		e->topxid = (uint32) key.pid;
 	memcpy(entry->plan, plan, plan_len);
 	entry->plan_len = plan_len;
 	entry->plan[plan_len] = '\0';
@@ -568,6 +707,9 @@ entry_store(char *plan, const int nested_level)
 	SpinLockRelease(&e->mutex);
 
 	LWLockRelease(pgsp->lock);
+		
+	/* Delete old entries where nested_level > current_level. */
+	entry_delete(key.pid,nested_level+1);
 }
 
 /*
@@ -656,16 +798,22 @@ entry_delete(const uint32 pid, const int nested_level)
 	pgspHashKey key;
 
 	/* Safety check... */
-	if (!pgsp || !pgsp_hash)
+	if (!pgsp || !pgsp_hash )
 		return;
 
 	key.pid = pid;
 	key.nested_level = nested_level;
 
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-	hash_search(pgsp_hash, &key, HASH_REMOVE, NULL);
+	do
+	{
+			hash_search(pgsp_hash, &key, HASH_REMOVE, NULL);
+			key.nested_level++;
+	}
+	while (hash_search(pgsp_hash, &key, HASH_FIND, NULL) != NULL);
 	LWLockRelease(pgsp->lock);
 }
+
 
 /*
  * Set state to is_enable
@@ -833,19 +981,20 @@ pg_show_plans(PG_FUNCTION_ARGS)
 		 */
 		if (!RecoveryInProgress())
 		{
-			if (TransactionIdDidCommit(entry->topxid)
-				|| TransactionIdDidAbort(entry->topxid))
-			{
-				LWLockRelease(pgsp->lock);
-
-				LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
-				LWLockRelease(pgsp->lock);
-
-				LWLockAcquire(pgsp->lock, LW_SHARED);
-
-				continue;
-			}
+//			if (
+//ply			TransactionIdDidCommit(entry->topxid) ||
+//				 TransactionIdDidAbort(entry->topxid))
+//			{
+//				LWLockRelease(pgsp->lock);
+//
+//				LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+//				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+//				LWLockRelease(pgsp->lock);
+//
+//				LWLockAcquire(pgsp->lock, LW_SHARED);
+//
+//				continue;
+//			}
 		}
 		else
 		{
@@ -864,37 +1013,37 @@ pg_show_plans(PG_FUNCTION_ARGS)
 			 * do not care about it because this function is not often
 			 * executed.
 			 */
-			int			num_backends = pgstat_fetch_stat_numbackends();
-			int			curr_backend;
-			uint32		pid = (uint32) entry->topxid;
-			bool		exists = false;
+//			int			num_backends = pgstat_fetch_stat_numbackends();
+//			int			curr_backend;
+//			uint32		pid = (uint32) entry->topxid;
+//			bool		exists = false;
 
-			for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
-			{
-				LocalPgBackendStatus *local_beentry;
-				PgBackendStatus *beentry;
+//			for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
+//			{
+//				LocalPgBackendStatus *local_beentry;
+//				PgBackendStatus *beentry;
 
-				local_beentry = pgstat_fetch_stat_local_beentry(curr_backend);
-				beentry = &local_beentry->backendStatus;
-				if (beentry->st_procpid == pid && beentry->st_state == STATE_RUNNING)
-				{
-					exists = true;
-					break;
-				}
-			}
+//				local_beentry = pgstat_fetch_stat_local_beentry(curr_backend);
+//				beentry = &local_beentry->backendStatus;
+//				if (beentry->st_procpid == pid && beentry->st_state == STATE_RUNNING)
+//				{
+//					exists = true;
+//					break;
+//				}
+//			}
 
-			if (!exists)
-			{
-				LWLockRelease(pgsp->lock);
+//			if (!exists)
+//			{
+//				LWLockRelease(pgsp->lock);
 
-				LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
-				LWLockRelease(pgsp->lock);
+//				LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+//				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+//				LWLockRelease(pgsp->lock);
 
-				LWLockAcquire(pgsp->lock, LW_SHARED);
+//				LWLockAcquire(pgsp->lock, LW_SHARED);
 
-				continue;
-			}
+//				continue;
+//			}
 		}
 
 		/* Set values */
@@ -905,6 +1054,8 @@ pg_show_plans(PG_FUNCTION_ARGS)
 		values[i++] = ObjectIdGetDatum(entry->key.nested_level);
 		values[i++] = ObjectIdGetDatum(entry->userid);
 		values[i++] = ObjectIdGetDatum(entry->dbid);
+		values[i++] = Int64GetDatumFast(entry->queryid);
+		
 
 		if (is_allowed_role || entry->userid == userid)
 		{
