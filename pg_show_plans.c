@@ -22,10 +22,6 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
-
-#include "storage/procarray.h"
-// cf PANIC
-
 #include "storage/spin.h"
 #include "storage/shmem.h"
 #include "tcop/utility.h"
@@ -255,6 +251,7 @@ pgsp_shmem_startup(void)
 {
 	bool		found;
 	HASHCTL		info;
+	TransactionId topxid;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -277,13 +274,13 @@ pgsp_shmem_startup(void)
 		pgsp->lock = LWLockAssign();
 #endif
 		SpinLockInit(&pgsp->elock);
-
 	/* Set the initial value to is_enable */
 	pgsp->is_enable = true;
 #if PG_VERSION_NUM >= 90500
 	pgsp->plan_format = plan_format;
 #endif
 	}
+
 	
 	/* Be sure everyone agrees on the hash table entry size */
 	memset(&info, 0, sizeof(info));
@@ -299,14 +296,26 @@ pgsp_shmem_startup(void)
 							  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
 	LWLockRelease(AddinShmemInitLock);
+	
+	/* 	
+		on MSYS2: on_proc_exit() is called only when there is 
+		an Assigned TransactionId, so keep one.
+		on Ubuntu: on_proc_exit() seems not being reached,
+		even with an Assigned Transaction Id !?
+		TODO: don't know how to fix that :o(
+	*/
+	if (!RecoveryInProgress())
+		topxid = GetTopTransactionId();
 
 	if (!IsUnderPostmaster)
 		on_shmem_exit(pgsp_shmem_shutdown, (Datum) 0);
 	else 
-		/* 	??? source de :
-			PANIC:  cannot wait without a PGPROC structure
-			à la déconection d'autovacuum ???
-			ajout de !IsBackendPid(pid) dans entry_delete
+		/* 	
+			"PANIC:  cannot wait without a PGPROC structure"
+			occured during autovacuum exit on MSYS2 !
+			TODO define the best fix:
+			??? restrict this to IsBackendPid(pid) 
+			or exclude IsAutoVacuumWorkerProcess ???
 		*/
 		on_proc_exit(pgsp_on_proc_exit,(Datum) 0);
 	
@@ -789,7 +798,7 @@ entry_delete(const uint32 pid, const int nested_level)
 	pgspHashKey key;
 
 	/* Safety check... */
-	if (!pgsp || !pgsp_hash || !IsBackendPid(pid))
+	if (!pgsp || !pgsp_hash )
 		return;
 
 	key.pid = pid;
