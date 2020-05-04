@@ -324,7 +324,7 @@ pgsp_shmem_startup(void)
 static void
 pgsp_on_proc_exit(int code, Datum arg)
 {
-	entry_delete(getpid(), 0);
+	entry_delete(MyProcPid, 0);
 	return;
 }
 
@@ -660,7 +660,7 @@ entry_store(char *plan, const int nested_level, const uint64 QueryId)
 	if (!pgsp || !pgsp_hash)
 		return;
 
-	key.pid = getpid();
+	key.pid = MyProcPid;
 	key.nested_level = nested_level;
 	plan_len = strlen(plan);
 
